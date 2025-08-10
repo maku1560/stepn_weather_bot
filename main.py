@@ -1,7 +1,6 @@
-# STEPN Weather Bot (Discord) - GPT-5 sample
-# 使い方：メンションと一緒に地名を送ると、直近3時間の天気を返します。
-# 例: @Bot 東京 / @Bot Osaka / @Bot 札幌
-# Slashコマンド: /weather location:<地名>
+# STEPN Weather Bot (Discord)
+# メンション or /weather で「地名・ランドマーク名」→ 直近3時間の天気を返す
+# 例: @Bot 大阪 / @Bot USJ / @Bot 東京ディズニーランド / /weather location:札幌
 #
 # 無料の Open-Meteo API を使用（APIキー不要）
 # - ジオコーディング: https://geocoding-api.open-meteo.com/v1/search
@@ -11,9 +10,12 @@
 # Discord側で "MESSAGE CONTENT INTENT" を有効にしてください。
 
 import os
-
-from dotenv import load_dotenv
-load_dotenv()
+# dotenv が無くても落ちないように（Koyeb等で環境変数だけでも動く）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 import re
 import asyncio
@@ -25,10 +27,10 @@ from discord import app_commands
 # ---- Config ----
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 JST = timezone(timedelta(hours=9))
-USER_AGENT = "STEPN-Weather-Bot/1.0 (contact: your-email@example.com)"
+USER_AGENT = "STEPN-Weather-Bot/1.1 (contact: your-email@example.com)"
 
 INTENTS = discord.Intents.default()
-INTENTS.message_content = True  # メッセージ本文を読むために必要
+INTENTS.message_content = True  # メッセージ本文の読み取り
 
 class WeatherBot(discord.Client):
     def __init__(self):
@@ -36,15 +38,26 @@ class WeatherBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        # スラッシュコマンドを同期
+        # スラッシュコマンド同期
         await self.tree.sync()
 
 client = WeatherBot()
 
 # ---- Utilities ----
 async def geocode(session: aiohttp.ClientSession, query: str):
+    """
+    地名・ランドマーク名から候補を最大10件取得し、
+    ・admin1 と country がある都市レベル
+    ・population (人口) が大きいもの
+    を優先して1件選ぶ。該当なければ先頭を返す。
+    """
     url = "https://geocoding-api.open-meteo.com/v1/search"
-    params = {"name": query, "count": 1, "language": "ja", "format": "json"}
+    params = {
+        "name": query,
+        "count": 10,          # 候補多めに
+        "language": "ja",
+        "format": "json"
+    }
     headers = {"User-Agent": USER_AGENT}
     async with session.get(url, params=params, headers=headers, timeout=15) as resp:
         if resp.status != 200:
@@ -53,7 +66,16 @@ async def geocode(session: aiohttp.ClientSession, query: str):
         results = data.get("results", [])
         if not results:
             return None
-        r = results[0]
+
+        # 都市レベル優先：admin1 & country を持つもの → population降順
+        candidates = [r for r in results if r.get("admin1") and r.get("country")]
+        if candidates:
+            candidates.sort(key=lambda r: (r.get("population") or 0), reverse=True)
+            r = candidates[0]
+        else:
+            # フォールバック：最初の候補
+            r = results[0]
+
         return {
             "name": r.get("name"),
             "latitude": r.get("latitude"),
@@ -78,40 +100,24 @@ async def fetch_forecast(session: aiohttp.ClientSession, lat: float, lon: float,
         return await resp.json()
 
 WEATHER_EMOJI = {
-    # Open-Meteo weather codes (simplified)
-    0: "☀️",  # Clear sky
-    1: "🌤️",  # Mainly clear
-    2: "⛅",   # Partly cloudy
-    3: "☁️",   # Overcast
-    45: "🌫️",  # Fog
-    48: "🌫️",  # Depositing rime fog
-    51: "🌦️",  # Drizzle
-    53: "🌦️",
-    55: "🌧️",
-    61: "🌦️",  # Rain
-    63: "🌧️",
-    65: "🌧️",
-    66: "🌧️",
-    67: "🌧️",
-    71: "🌨️",  # Snow fall
-    73: "🌨️",
-    75: "❄️",
-    77: "❄️",
-    80: "🌧️",  # Rain showers
-    81: "🌧️",
-    82: "⛈️",
-    85: "🌨️",  # Snow showers
-    86: "🌨️",
-    95: "⛈️",  # Thunderstorm
-    96: "⛈️",
-    99: "⛈️"
+    0: "☀️", 1: "🌤️", 2: "⛅", 3: "☁️",
+    45: "🌫️", 48: "🌫️",
+    51: "🌦️", 53: "🌦️", 55: "🌧️",
+    61: "🌦️", 63: "🌧️", 65: "🌧️", 66: "🌧️", 67: "🌧️",
+    71: "🌨️", 73: "🌨️", 75: "❄️", 77: "❄️",
+    80: "🌧️", 81: "🌧️", 82: "⛈️",
+    85: "🌨️", 86: "🌨️",
+    95: "⛈️", 96: "⛈️", 99: "⛈️"
 }
 
 def pick_emoji(code: int) -> str:
     return WEATHER_EMOJI.get(code, "🌡️")
 
 def build_embed(place: dict, rows: list[dict]) -> discord.Embed:
-    title = f"{place['name']}（{place.get('admin1') or ''}{'・' if place.get('admin1') else ''}{place.get('country') or ''}）"
+    loc = place['name']
+    admin = place.get('admin1') or ''
+    country = place.get('country') or ''
+    title = f"{loc}（{admin + '・' if admin else ''}{country}）".strip("（）")
     embed = discord.Embed(title=f"直近3時間の天気 | {title}", color=0x4C7CF3)
     lines = []
     for r in rows:
@@ -123,13 +129,14 @@ def build_embed(place: dict, rows: list[dict]) -> discord.Embed:
         )
     embed.description = "\n".join(lines)
     ts = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
-    embed.set_footer(text=f"更新: {ts} JST • Powered by Open‑Meteo")
+    embed.set_footer(text=f"更新: {ts} JST • Powered by Open-Meteo")
     return embed
 
 async def get_next_3_hours(session: aiohttp.ClientSession, place_query: str):
+    # そのままランドマーク/地名を検索
     geo = await geocode(session, place_query)
     if not geo:
-        return None, None, "場所が見つからへんかったで。別の表記でもう一回試してな。例：東京/大阪/札幌/京都市 など"
+        return None, None, "場所が見つからへんかったで。別の表記でもう一回試してな。例：東京/大阪/札幌/京都市・USJ・東京ディズニーランド など"
 
     data = await fetch_forecast(session, geo["latitude"], geo["longitude"], geo["timezone"])
     if not data or "hourly" not in data:
@@ -141,16 +148,14 @@ async def get_next_3_hours(session: aiohttp.ClientSession, place_query: str):
     precs = data["hourly"].get("precipitation", [0.0]*len(times))
     codes = data["hourly"].get("weathercode", [0]*len(times))
 
-    # 現在時刻以降の3件を抽出（APIは現地タイムゾーンで返す）
+    # 現在時刻以降の3件を抽出（表示はJST）
     now = datetime.now(JST)
     rows = []
     for i, ts in enumerate(times):
-        # tsはISO8601文字列
         try:
             t = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(JST)
         except Exception:
-            # 念のため
-            t = now
+            continue
         if t >= now and len(rows) < 3:
             rows.append({
                 "time": t,
@@ -170,15 +175,13 @@ async def get_next_3_hours(session: aiohttp.ClientSession, place_query: str):
 MENTION_PATTERN = re.compile(r"<@!?(\d+)>")
 
 def extract_query_from_message(content: str, bot_id: int) -> str | None:
-    # メンション形式の直後の文字列を地名として使う
-    # 例: "<@1234567890> 東京駅" -> "東京駅"
+    # メンション直後の文字列を地名として使う
     m = MENTION_PATTERN.search(content)
     if not m:
         return None
     mentioned_id = int(m.group(1))
     if mentioned_id != bot_id:
         return None
-    # メンション部分を削除して残りをトリム
     rest = MENTION_PATTERN.sub("", content, count=1).strip()
     return rest or None
 
@@ -189,11 +192,9 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
-    # Bot自身の発言は無視
     if message.author.bot:
         return
 
-    # メンション＋地名で応答
     query = extract_query_from_message(message.content, client.user.id)
     if not query:
         return
@@ -208,8 +209,8 @@ async def on_message(message: discord.Message):
             await message.reply(embed=embed, mention_author=False)
 
 # ---- Slash command ----
-@client.tree.command(name="weather", description="地名を指定して直近3時間の天気を表示します")
-@app_commands.describe(location="地名（例：東京, Osaka, 札幌）")
+@client.tree.command(name="weather", description="地名・ランドマーク名から直近3時間の天気を表示します")
+@app_commands.describe(location="地名/ランドマーク（例：大阪, USJ, 東京ディズニーランド, 札幌）")
 async def weather(interaction: discord.Interaction, location: str):
     await interaction.response.defer(thinking=True)
     async with aiohttp.ClientSession() as session:

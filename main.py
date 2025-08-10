@@ -1,6 +1,7 @@
-# STEPN Weather Bot v2025-08-10-8
+# STEPN Weather Bot v2025-08-10-9
 # 直近3時間の天気 + 矛盾なしコメント(天気×気温×時間帯) + 強風追記 + 方言スキン + AA顔文字
-# 安全化: comments未定義や欠落時でも落ちないフォールバック付き
+# 仕様: まずコメントを“中立(標準)”に正規化 → 地域ごとの方言スキンを適用
+# 安全化: comments欠落時でも落ちないフォールバック付き
 
 import os
 import re
@@ -19,7 +20,7 @@ import discord
 from discord import app_commands
 
 # ---- Config ----
-BOT_VERSION = "2025-08-10-8"
+BOT_VERSION = "2025-08-10-9"
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 JST = timezone(timedelta(hours=9))
 USER_AGENT = f"STEPN-Weather-Bot/{BOT_VERSION} (contact: your-email@example.com)"
@@ -164,7 +165,7 @@ def categorize_time(rows):
     if 16 <= h <= 18: return "evening"
     return "night"
 
-# ---------- 矛盾なしコメント辞書（各3本） ----------
+# ---------- 矛盾なしコメント辞書（各3本・ベースは関西寄りだが後で中立化→方言化） ----------
 comments = {
     "clear": {
         "cold": {
@@ -605,13 +606,13 @@ comments = {
 # ---------- 方言スキン ----------
 DIALECT_PACKS = {
     "kansai":   {"intense":["めっちゃ","ようさん","だいぶ"], "end":["や","で","やで","やな","やわ"]},
-    "tokyo":    {"intense":["すごく","かなり","けっこう"],   "end":["だよ","だね","かな","だわ","かも"]},
+    "tokyo":    {"intense":["すごく","かなり","けっこう"],   "end":["だよ","だね","かな","かも","よ"]},  # 「だわ」は外す
     "nagoya":   {"intense":["でら","どえりゃあ","ようけ"],   "end":["だで","だがね","だわ"]},
     "hokkaido": {"intense":["なまら","わや","たっけ"],       "end":["だべさ","だっしょ","でないかい"]},
     "tohoku":   {"intense":["いっぺぇ","だいぶ","わんつか"],  "end":["だべ","だっちゃ","だな"]},
     "hiroshima":{"intense":["ぶち","たいぎいくらい","ぎょうさん"], "end":["じゃけぇ","しんさい","なんよ"]},
     "hakata":   {"intense":["ばり","とっとーと","ようけ"],     "end":["っちゃ","ばい","たい"]},
-    "okinawa":  {"intense":["ちゅらい","とても","かなり"],     "end":["さー","ねー","よー"]},
+    "okinawa":  {"intense":["とても","かなり","ちゅらい"],     "end":["さー","ねー","よー"]},
 }
 
 def pick_dialect_key(place: dict) -> str:
@@ -632,18 +633,57 @@ def pick_dialect_key(place: dict) -> str:
         return "hakata"
     if pref == "沖縄県":
         return "okinawa"
-    return "kansai"
+    # ★未知は “tokyo”（中立）に
+    return "tokyo"
+
+# ---------- 関西→標準 正規化 → 方言スキン適用 ----------
+KANSAI_TO_NEUTRAL = [
+    (r"無理せんと", "無理せず"),
+    (r"気ぃつけ", "気をつけ"),
+    (r"しよな", "しようね"),
+    (r"しよか", "しようか"),
+    (r"しよ", "しよう"),
+    (r"やろ", "だろう"),
+    (r"せんとこ", "しないでおこう"),
+    (r"せんと", "しないと"),
+    (r"帰ろ(?!う)", "帰ろう"),
+]
+
+def neutralize(text: str) -> str:
+    # 文末の関西語尾を落として中立化
+    def drop_kansai_tail(s: str) -> str:
+        return re.sub(r"(やで|やな|やわ|や|で)$", "", s)
+    sents = [t.strip() for t in re.split(r"。+", text) if t.strip()]
+    out = []
+    for s in sents:
+        s = drop_kansai_tail(s)
+        for pat, rep in KANSAI_TO_NEUTRAL:
+            s = re.sub(pat, rep)
+        out.append(s)
+    return "。".join(out) + "。"
 
 def dialectize(text: str, key: str) -> str:
-    pack = DIALECT_PACKS.get(key, DIALECT_PACKS["kansai"])
+    # 1) 中立化
+    text = neutralize(text)
+    # 2) スキン適用
+    pack = DIALECT_PACKS.get(key, DIALECT_PACKS["tokyo"])
     for base in ["めっちゃ","すごく","かなり","けっこう","だいぶ"]:
         text = re.sub(re.escape(base), random.choice(pack["intense"]), text)
+
+    # 末尾付与は“断定文”だけ。勧誘/依頼/命令っぽいものは付けない。
     def tweak_sent(s):
         s = s.strip()
-        if not s: return s
+        if not s:
+            return s
+        # すでに強い語尾 or 勧誘/依頼/命令なら付与しない
+        if re.search(r"(しよう|よう|ろう|てね|ください|してね|して|しまおう|しなきゃ|しましょう|くださいね|しようね|しまおうね)$", s):
+            return s
+        if re.search(r"[!?！？]$", s):
+            return s
         end = random.choice(pack["end"])
-        s = re.sub(r"(や|で|です|だ|ね|よ|わ|たい|ばい|じゃけぇ|さー|ねー|よー)$","", s)
+        s = re.sub(r"(です|だ|ね|よ|わ)$", "", s)
         return s + end
+
     sentences = [tweak_sent(s) for s in re.split(r"。+", text) if s.strip()]
     return "。".join(sentences) + "。"
 
@@ -676,7 +716,7 @@ def pick_safe_comment(w: str, t: str, d: str) -> str:
                 lst = tdict.get(dkey)
                 if lst:
                     return random.choice(lst)
-    return "今日はわりと無難なコンディションや。安全第一でいこ。"
+    return "今日はわりと無難なコンディション。安全第一でいこう。"
 
 # ---------- コメント生成（安全化） ----------
 def build_comment_base(rows: list[dict]) -> str:
@@ -691,21 +731,21 @@ def build_comment_base(rows: list[dict]) -> str:
         thunder  = any(r['weathercode'] in (95,96,99) for r in rows)
         rainlike = any(r['weathercode'] in (51,53,55,61,63,65,66,67,80,81,82) for r in rows)
         if thunder:
-            base = "雷の可能性ある。外出は気ぃつけてな"
+            base = "雷の可能性がある。外出は気をつけてね"
         elif rainlike:
-            base = "雨来そうや、傘あると安心やで"
+            base = "雨が来そう。傘があると安心だよ"
         elif max_temp >= 28:
-            base = "暑いで、水分しっかりな"
+            base = "暑いから水分しっかりね"
         elif max_temp < 10:
-            base = "冷えるで、あったかくしてな"
+            base = "冷えるから暖かくしていこう"
         else:
-            base = "今日は過ごしやすそうや"
+            base = "今日は過ごしやすそうだよ"
 
     max_wind = max(r.get("wind", 0.0) for r in rows)
     if max_wind >= 15:
-        base += " 風つよすぎるで、帽子や傘は要注意。"
+        base += " 風が強すぎるから、帽子や傘は要注意。"
     elif max_wind >= 10:
-        base += " 風が強めやから、洗濯物と自転車は気ぃつけてな。"
+        base += " 風が強めだから、洗濯物と自転車は気をつけてね。"
     return base
 
 # ---------- 表示 ----------
@@ -730,10 +770,10 @@ def build_embed(place: dict, rows: list[dict]) -> discord.Embed:
 async def get_next_3_hours(session: aiohttp.ClientSession, place_query: str):
     geo = await geocode(session, place_query)
     if not geo:
-        return None, None, "場所が見つからへんかったで。別の表記でもう一回試してな。"
+        return None, None, "場所が見つかりませんでした。別の表記でもう一度試してね。"
     data = await fetch_forecast(session, geo["latitude"], geo["longitude"], geo["timezone"])
     if not data or "hourly" not in data:
-        return geo, None, "天気データの取得に失敗したわ。"
+        return geo, None, "天気データの取得に失敗しました。時間をおいて再度お試しください。"
 
     times = data["hourly"]["time"]
     temps = data["hourly"]["temperature_2m"]
@@ -761,7 +801,7 @@ async def get_next_3_hours(session: aiohttp.ClientSession, place_query: str):
         if len(rows) == 3:
             break
     if not rows:
-        return geo, None, "直近3時間分のデータが見つからんかったわ。"
+        return geo, None, "直近3時間のデータが見つかりませんでした。"
     return geo, rows, None
 
 # ---------- Message handling ----------
@@ -791,7 +831,11 @@ async def on_message(message: discord.Message):
         async with aiohttp.ClientSession() as session:
             place, rows, err = await get_next_3_hours(session, query)
             if err:
-                await message.reply(err, mention_author=False); return
+                # エラーも方言化して返す
+                dialect = pick_dialect_key(place or {"admin1": None})
+                await message.reply(dialectize(err, dialect), mention_author=False)
+                return
+
             embed = build_embed(place, rows)
             try:
                 base = build_comment_base(rows)
@@ -809,7 +853,10 @@ async def weather(interaction: discord.Interaction, location: str):
     async with aiohttp.ClientSession() as session:
         place, rows, err = await get_next_3_hours(session, location)
         if err:
-            await interaction.followup.send(err, ephemeral=True); return
+            dialect = pick_dialect_key(place or {"admin1": None})
+            await interaction.followup.send(dialectize(err, dialect), ephemeral=True)
+            return
+
         embed = build_embed(place, rows)
         try:
             base = build_comment_base(rows)

@@ -1,7 +1,7 @@
-# STEPN Weather Bot v2025-08-10-9
-# 直近3時間の天気 + 矛盾なしコメント(天気×気温×時間帯) + 強風追記 + 方言スキン + AA顔文字
-# 仕様: まずコメントを“中立(標準)”に正規化 → 地域ごとの方言スキンを適用
-# 安全化: comments欠落時でも落ちないフォールバック付き
+# STEPN Weather Bot v2025-08-10-10
+# 機能: 直近3時間の天気 + 矛盾なしコメント(天気×気温×時間帯) + 強風追記
+#       方言スキン（中立→方言化） + AA顔文字（頻度UP） + 柔らか語尾
+# 安全化: comments欠落時でも落ちないフォールバック、エラー文も方言＆AA
 
 import os
 import re
@@ -20,7 +20,7 @@ import discord
 from discord import app_commands
 
 # ---- Config ----
-BOT_VERSION = "2025-08-10-9"
+BOT_VERSION = "2025-08-10-10"
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 JST = timezone(timedelta(hours=9))
 USER_AGENT = f"STEPN-Weather-Bot/{BOT_VERSION} (contact: your-email@example.com)"
@@ -165,7 +165,7 @@ def categorize_time(rows):
     if 16 <= h <= 18: return "evening"
     return "night"
 
-# ---------- 矛盾なしコメント辞書（各3本・ベースは関西寄りだが後で中立化→方言化） ----------
+# ---------- 矛盾なしコメント辞書（各3本・ベース関西→後で中立化→方言化） ----------
 comments = {
     "clear": {
         "cold": {
@@ -482,7 +482,7 @@ comments = {
                 "道路の端が凍りやすい、踏まんようにな",
             ],
         },
-        "warm": {  # 雪×暖かいは稀なので“みぞれ/解けやすい”トーン
+        "warm": {
             "morning": [
                 "みぞれ気味でベチャつく、撥水の靴が安心や",
                 "解けかけで滑るで、歩幅は小さめに",
@@ -504,7 +504,7 @@ comments = {
                 "冷え込みに備えて温かいもので体力回復や",
             ],
         },
-        "hot": {  # ほぼ起きないのでwarmと同系でフォールバック
+        "hot": {
             "morning": ["珍しいコンディションや、足元最優先でな"]*3,
             "noon": ["無理せんで、安全第一や"]*3,
             "evening": ["帰りは早めに動こ"]*3,
@@ -606,7 +606,8 @@ comments = {
 # ---------- 方言スキン ----------
 DIALECT_PACKS = {
     "kansai":   {"intense":["めっちゃ","ようさん","だいぶ"], "end":["や","で","やで","やな","やわ"]},
-    "tokyo":    {"intense":["すごく","かなり","けっこう"],   "end":["だよ","だね","かな","かも","よ"]},  # 「だわ」は外す
+    # ★東京はやわらか語尾を厚めに
+    "tokyo":    {"intense":["すごく","かなり","けっこう"],   "end":["だよ","だね","だよね","かな","かもね","だなあ","だねぇ"]},
     "nagoya":   {"intense":["でら","どえりゃあ","ようけ"],   "end":["だで","だがね","だわ"]},
     "hokkaido": {"intense":["なまら","わや","たっけ"],       "end":["だべさ","だっしょ","でないかい"]},
     "tohoku":   {"intense":["いっぺぇ","だいぶ","わんつか"],  "end":["だべ","だっちゃ","だな"]},
@@ -633,10 +634,10 @@ def pick_dialect_key(place: dict) -> str:
         return "hakata"
     if pref == "沖縄県":
         return "okinawa"
-    # ★未知は “tokyo”（中立）に
+    # 未知は“中立”の東京
     return "tokyo"
 
-# ---------- 関西→標準 正規化 → 方言スキン適用 ----------
+# ---------- 関西→標準 正規化 → 方言スキン適用 + 柔らか砂糖 ----------
 KANSAI_TO_NEUTRAL = [
     (r"無理せんと", "無理せず"),
     (r"気ぃつけ", "気をつけ"),
@@ -649,8 +650,9 @@ KANSAI_TO_NEUTRAL = [
     (r"帰ろ(?!う)", "帰ろう"),
 ]
 
+SOFT_TAILS = ["よね", "かな", "ね〜", "なあ", "かも", "かもね", "よ〜", "ねぇ"]
+
 def neutralize(text: str) -> str:
-    # 文末の関西語尾を落として中立化
     def drop_kansai_tail(s: str) -> str:
         return re.sub(r"(やで|やな|やわ|や|で)$", "", s)
     sents = [t.strip() for t in re.split(r"。+", text) if t.strip()]
@@ -662,6 +664,19 @@ def neutralize(text: str) -> str:
         out.append(s)
     return "。".join(out) + "。"
 
+def add_soft_tail(text: str, prob=0.6):
+    if random.random() >= prob:
+        return text
+    sents = [s.strip() for s in re.split(r"。+", text) if s.strip()]
+    if not sents:
+        return text
+    i = random.randrange(len(sents))
+    # 既に終助詞があれば足さない
+    if re.search(r"(よ|ね|な|かも|たい|ばい|じゃけぇ|さー|よー|ねー)$", sents[i]):
+        return "。".join(sents) + "。"
+    sents[i] = sents[i] + random.choice(SOFT_TAILS)
+    return "。".join(sents) + "。"
+
 def dialectize(text: str, key: str) -> str:
     # 1) 中立化
     text = neutralize(text)
@@ -670,12 +685,11 @@ def dialectize(text: str, key: str) -> str:
     for base in ["めっちゃ","すごく","かなり","けっこう","だいぶ"]:
         text = re.sub(re.escape(base), random.choice(pack["intense"]), text)
 
-    # 末尾付与は“断定文”だけ。勧誘/依頼/命令っぽいものは付けない。
+    # 末尾付与は断定文だけ（依頼・勧誘には付けない）
     def tweak_sent(s):
         s = s.strip()
         if not s:
             return s
-        # すでに強い語尾 or 勧誘/依頼/命令なら付与しない
         if re.search(r"(しよう|よう|ろう|てね|ください|してね|して|しまおう|しなきゃ|しましょう|くださいね|しようね|しまおうね)$", s):
             return s
         if re.search(r"[!?！？]$", s):
@@ -685,15 +699,17 @@ def dialectize(text: str, key: str) -> str:
         return s + end
 
     sentences = [tweak_sent(s) for s in re.split(r"。+", text) if s.strip()]
-    return "。".join(sentences) + "。"
+    out = "。".join(sentences) + "。"
+    # 3) やわらか砂糖
+    return add_soft_tail(out, prob=0.6)
 
 # ---------- AA ----------
 AA = ["|ω・)", "(/ω＼)", "( ´ ▽ ` )", "(￣▽￣;)", "(｀・ω・´)", "( ˘ω˘ )", "(｡･ω･｡)", "(；・∀・)", "(・∀・)", "(>_<)"]
-def maybe_aa(p=0.6): return (" " + random.choice(AA)) if random.random() < p else ""
+def maybe_aa(p=0.85):  # ★頻度UP
+    return (" " + random.choice(AA)) if random.random() < p else ""
 
 # ---------- 安全にコメントを拾う（フォールバック） ----------
 def pick_safe_comment(w: str, t: str, d: str) -> str:
-    """comments[w][t][d] が無くても落ちへんフォールバック取得"""
     weather_order = {
         "thunder": ["thunder","rain","cloudy","clear"],
         "snow":    ["snow","cloudy","clear"],
@@ -706,7 +722,7 @@ def pick_safe_comment(w: str, t: str, d: str) -> str:
 
     for wkey in weather_order.get(w, ["cloudy","clear"]):
         wdict = comments.get(wkey)
-        if not wdict: 
+        if not wdict:
             continue
         for tkey in [t] + [k for k in temp_keys if k != t]:
             tdict = wdict.get(tkey)
@@ -831,19 +847,21 @@ async def on_message(message: discord.Message):
         async with aiohttp.ClientSession() as session:
             place, rows, err = await get_next_3_hours(session, query)
             if err:
-                # エラーも方言化して返す
                 dialect = pick_dialect_key(place or {"admin1": None})
-                await message.reply(dialectize(err, dialect), mention_author=False)
+                await message.reply(dialectize(err, dialect) + maybe_aa(), mention_author=False)
                 return
 
             embed = build_embed(place, rows)
             try:
                 base = build_comment_base(rows)
                 dialect = pick_dialect_key(place)
-                comment = dialectize(base, dialect) + maybe_aa()
+                comment = dialectize(base, dialect)
+                # 最低1個はAA
+                if not re.search(r"\(|\||／", comment):
+                    comment += maybe_aa()
             except Exception as e:
                 print(f"[WARN] dialectize failed: {e}")
-                comment = base
+                comment = base + maybe_aa()
             await message.reply(content=comment, embed=embed, mention_author=False)
 
 @client.tree.command(name="weather", description="地名・ランドマーク名から直近3時間の天気を表示します")
@@ -854,17 +872,19 @@ async def weather(interaction: discord.Interaction, location: str):
         place, rows, err = await get_next_3_hours(session, location)
         if err:
             dialect = pick_dialect_key(place or {"admin1": None})
-            await interaction.followup.send(dialectize(err, dialect), ephemeral=True)
+            await interaction.followup.send(dialectize(err, dialect) + maybe_aa(), ephemeral=True)
             return
 
         embed = build_embed(place, rows)
         try:
             base = build_comment_base(rows)
             dialect = pick_dialect_key(place)
-            comment = dialectize(base, dialect) + maybe_aa()
+            comment = dialectize(base, dialect)
+            if not re.search(r"\(|\||／", comment):
+                comment += maybe_aa()
         except Exception as e:
             print(f"[WARN] dialectize failed: {e}")
-            comment = base
+            comment = base + maybe_aa()
         await interaction.followup.send(content=comment, embed=embed)
 
 def main():

@@ -1,4 +1,6 @@
-# STEPN Weather Bot v2025-08-10-3 （ランドマーク対応強化＋関西弁コメント10種×条件）
+# STEPN Weather Bot v2025-08-10-5
+# 直近3時間の天気を返す + 天気×気温×時間帯の関西弁コメント（各軸5パターン）＋AA顔文字
+
 import os
 import re
 import random
@@ -16,13 +18,13 @@ import discord
 from discord import app_commands
 
 # ---- Config ----
-BOT_VERSION = "2025-08-10-3"
+BOT_VERSION = "2025-08-10-5"
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 JST = timezone(timedelta(hours=9))
 USER_AGENT = f"STEPN-Weather-Bot/{BOT_VERSION} (contact: your-email@example.com)"
 
 INTENTS = discord.Intents.default()
-INTENTS.message_content = True  # メンション文面を読むのに必要
+INTENTS.message_content = True  # メンションを読むのに必要
 
 class WeatherBot(discord.Client):
     def __init__(self):
@@ -80,20 +82,10 @@ async def geocode(session: aiohttp.ClientSession, query: str):
         "横浜中華街": "横浜市 中区",
     }
     romaji = {
-        "大阪": "Osaka",
-        "京都": "Kyoto",
-        "札幌": "Sapporo",
-        "名古屋": "Nagoya",
-        "福岡": "Fukuoka",
-        "神戸": "Kobe",
-        "横浜": "Yokohama",
-        "仙台": "Sendai",
-        "千葉": "Chiba",
-        "川崎": "Kawasaki",
-        "さいたま": "Saitama",
-        "那覇": "Naha",
-        "広島": "Hiroshima",
-        "金沢": "Kanazawa",
+        "大阪": "Osaka", "京都": "Kyoto", "札幌": "Sapporo", "名古屋": "Nagoya",
+        "福岡": "Fukuoka", "神戸": "Kobe", "横浜": "Yokohama", "仙台": "Sendai",
+        "千葉": "Chiba", "川崎": "Kawasaki", "さいたま": "Saitama", "那覇": "Naha",
+        "広島": "Hiroshima", "金沢": "Kanazawa",
     }
 
     trials = [query]
@@ -109,8 +101,7 @@ async def geocode(session: aiohttp.ClientSession, query: str):
     seen, uniq_trials = set(), []
     for t in trials:
         if t not in seen:
-            uniq_trials.append(t)
-            seen.add(t)
+            uniq_trials.append(t); seen.add(t)
 
     for q in uniq_trials:
         results = await search(q)
@@ -130,9 +121,11 @@ async def geocode(session: aiohttp.ClientSession, query: str):
 async def fetch_forecast(session: aiohttp.ClientSession, lat: float, lon: float, tz: str):
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m,precipitation_probability,precipitation,weathercode",
+        "latitude": lat, "longitude": lon,
+        "hourly": (
+            "temperature_2m,precipitation_probability,precipitation,weathercode,"
+            "windspeed_10m"
+        ),
         "timezone": tz or "Asia/Tokyo"
     }
     headers = {"User-Agent": USER_AGENT}
@@ -149,6 +142,172 @@ WEATHER_EMOJI = {
 }
 def pick_emoji(code:int)->str: return WEATHER_EMOJI.get(code,"🌡️")
 
+def categorize_weather(rows: list[dict]) -> str:
+    """weather: clear/cloudy/rain/snow/thunder/windy のいずれか"""
+    codes = [r["weathercode"] for r in rows]
+    winds = [r.get("wind", 0.0) for r in rows]
+    if any(c in (95,96,99) for c in codes):
+        return "thunder"
+    if any(c in (71,73,75,77,85,86) for c in codes):
+        return "snow"
+    if any(c in (51,53,55,61,63,65,66,67,80,81,82) for c in codes):
+        return "rain"
+    if max(winds or [0.0]) >= 10.0:  # 10m/s以上で「強風」扱い
+        return "windy"
+    if all(c in (0,1,2) for c in codes):
+        return "clear"
+    return "cloudy"
+
+def categorize_temp(rows: list[dict]) -> str:
+    """temp: cold(<10) / cool(10-20) / warm(20-28) / hot(>=28)"""
+    max_temp = max(r["temp"] for r in rows)
+    if max_temp < 10:
+        return "cold"
+    if max_temp < 20:
+        return "cool"
+    if max_temp < 28:
+        return "warm"
+    return "hot"
+
+def categorize_time(rows: list[dict]) -> str:
+    """time band: morning(5-9) / noon(10-15) / evening(16-18) / night(19-4)"""
+    # 先頭の時間帯で代表させる
+    h = rows[0]["time"].hour
+    if 5 <= h <= 9:
+        return "morning"
+    if 10 <= h <= 15:
+        return "noon"
+    if 16 <= h <= 18:
+        return "evening"
+    return "night"
+
+# ---------- コメントパターン辞書（各軸5パターン＋AA混ぜ） ----------
+AA = ["|ω・)", "(/ω＼)", "( ´ ▽ ` )", "(￣▽￣;)", "(｀・ω・´)", "( ˘ω˘ )", "(｡･ω･｡)", "(；・∀・)", "(・∀・)", "(>_<)"]
+def maybe_aa(prob=0.6):
+    return (" " + random.choice(AA)) if random.random() < prob else ""
+
+WEATHER_TEXT = {
+    "clear": [
+        "ええ天気やな☀️",
+        "日差したっぷりやで",
+        "空、スカッと晴れとるわ",
+        "今日は青空がご機嫌さんや",
+        "洗濯日和ってやつやね",
+    ],
+    "cloudy": [
+        "雲多めやな",
+        "どんよりしとるけど雨まではいかんかな",
+        "薄曇りって感じや",
+        "空はグレーやけどまだ平和やで",
+        "日差しは控えめやな",
+    ],
+    "rain": [
+        "雨来そう（or降っとる）で☔",
+        "空気しっとりや、傘あると安心やで",
+        "路面濡れてるから足元注意や",
+        "ザーッと来るかも、用心しときや",
+        "にわか雨の匂いするなぁ",
+    ],
+    "snow": [
+        "雪の気配や❄️",
+        "白いの降っとるかもや",
+        "路面滑りやすいで、ほんま注意な",
+        "手先冷える雪空やで",
+        "景色は綺麗やけど足元キケンや",
+    ],
+    "thunder": [
+        "雷の可能性あるで⚡",
+        "ゴロゴロ来るかも、外は気ぃつけや",
+        "稲光あったら建物に避難やで",
+        "雷雨注意、無理な外出はやめとこ",
+        "空の機嫌が悪いわ、要警戒や",
+    ],
+    "windy": [
+        "風つよいで🌬️",
+        "突風ありそうや、帽子飛ぶで",
+        "体感温度下がる風やな",
+        "洗濯物は要クリップやで",
+        "自転車の横風に注意や",
+    ],
+}
+
+TEMP_TEXT = {
+    "cold": [
+        "めっちゃ冷える、厚着でな",
+        "手袋とマフラー出番やで",
+        "カイロあると心強いで",
+        "外は冷蔵庫みたいや",
+        "寒の戻り感あるわ",
+    ],
+    "cool": [
+        "ひんやり気持ちええな",
+        "軽めの上着あると安心や",
+        "歩くにはちょうどええ体感やで",
+        "空気がスッとして心地ええな",
+        "汗かかん程度で快適や",
+    ],
+    "warm": [
+        "ぽかぽかで過ごしやすい",
+        "薄手で十分やな",
+        "外に出るのが捗る気温やで",
+        "散歩日和や、気持ちええわ",
+        "ちょうど春〜初夏の感じや",
+    ],
+    "hot": [
+        "暑いで💦 水分しっかりな",
+        "日差しキツい、日焼け止め忘れんといて",
+        "無理は禁物、日陰で休憩や",
+        "アイスがうまい気温やな",
+        "熱中症注意、帽子あるとええで",
+    ],
+}
+
+TIME_TEXT = {
+    "morning": [
+        "朝は体起こすまでゆっくりいこ",
+        "通勤時間は足元と信号に注意や",
+        "朝活にはちょうどええかも",
+        "寝ぼけて転ばへんようにな",
+        "モーニング日差しで目覚めスッキリや",
+    ],
+    "noon": [
+        "昼は動きやすい時間帯やな",
+        "外回りは今のうちに済ませよ",
+        "日差し真上やから日陰選んで歩こ",
+        "ランチの行列は余裕持ってな",
+        "体力使いすぎんようこまめに休憩や",
+    ],
+    "evening": [
+        "夕方は冷え戻るから一枚あると安心や",
+        "帰りは空の機嫌に注意しとこ",
+        "日没前後は視界が落ちるで、気ぃつけて",
+        "寄り道は控えめに安全第一や",
+        "夕焼け見れたらラッキーやな",
+    ],
+    "night": [
+        "夜道は暗いで、足元と車に注意な",
+        "冷え込むから帰りは急ぎめで",
+        "遅い時間は無理せんと帰ろ",
+        "視界悪いから反射材あると安心や",
+        "終電前には撤収やで",
+    ],
+}
+
+def build_comment(rows: list[dict]) -> str:
+    """天気×気温×時間帯の各軸から1つずつ選んで、AAもランダム添え。"""
+    w = categorize_weather(rows)
+    t = categorize_temp(rows)
+    d = categorize_time(rows)
+
+    w_txt = random.choice(WEATHER_TEXT[w])
+    t_txt = random.choice(TEMP_TEXT[t])
+    d_txt = random.choice(TIME_TEXT[d])
+
+    # 文を自然に繋ぐ
+    base = f"{w_txt}。{t_txt}。{d_txt}。"
+    return base + maybe_aa()
+
+# ---------- 表示 ----------
 def build_embed(place: dict, rows: list[dict]) -> discord.Embed:
     loc = place['name']; admin = place.get('admin1') or ''; country = place.get('country') or ''
     title = f"{loc}（{admin + '・' if admin else ''}{country}）".strip("（）")
@@ -156,90 +315,15 @@ def build_embed(place: dict, rows: list[dict]) -> discord.Embed:
     lines=[]
     for r in rows:
         t=r['time']; emoji=pick_emoji(r['weathercode'])
-        lines.append(f"**{t.strftime('%H:%M')}** {emoji}  気温 **{r['temp']:.1f}°C**  降水確率 **{r['pop']}%**  降水量 **{r['precip']:.1f}mm**")
+        wind = r.get("wind", 0.0)
+        lines.append(
+            f"**{t.strftime('%H:%M')}** {emoji}  気温 **{r['temp']:.1f}°C**  "
+            f"降水確率 **{r['pop']}%**  降水量 **{r['precip']:.1f}mm**  風速 **{wind:.1f}m/s**"
+        )
     embed.description="\n".join(lines)
     ts=datetime.now(JST).strftime('%Y-%m-%d %H:%M')
     embed.set_footer(text=f"更新: {ts} JST • Powered by Open-Meteo")
     return embed
-
-# ---------- KANSAI comments (10 patterns each) ----------
-def build_comment(rows: list[dict]) -> str:
-    """直近3時間の条件から関西弁で一言アドバイス（条件ごとに10パターンをランダム）"""
-    max_temp = max(r['temp'] for r in rows)
-    max_pop  = max(r['pop'] for r in rows)
-    sum_prec = sum(r['precip'] for r in rows)
-    thunder  = any(r['weathercode'] in (95,96,99) for r in rows)
-
-    thunder_comments = [
-        "雷ゴロゴロや、外出は気ぃつけや！",
-        "雷雨来るかもやで。気ぃ引き締めてな。",
-        "雷注意や、今日は空見上げる暇ないで。",
-        "ゴロゴロ音したら即退避や！",
-        "雷雲近づいとるわ、傘あっても危険やで。",
-        "今日は稲妻ショーかもしれん。安全第一や！",
-        "雷雨の予感、外やとほんま危ないで。",
-        "雷鳴ったら即建物に入るんやで！",
-        "ピカッと来たらドン！や、油断せんといてな。",
-        "雷注意報レベルや、外は最小限でな。",
-    ]
-    rain_comments = [
-        "傘持ってった方がええな。濡れんようにね。",
-        "雨来そうや、傘忘れたら後悔するで。",
-        "今日はカッパの出番かもな。",
-        "折りたたみ傘は必須やで。",
-        "降る前に帰るんが賢いで。",
-        "雨靴あったら履いときや。",
-        "濡れると風邪ひくで、用心しいや。",
-        "洗濯物は部屋干し推奨やな。",
-        "降水確率高めや、濡れる覚悟しときや。",
-        "雨の日コーデで行こか。",
-    ]
-    hot_comments = [
-        "暑なりそうや。水分しっかり取っていこ。",
-        "今日は真夏日やな、日焼け止め忘れずに！",
-        "汗だく覚悟で行動やな。",
-        "熱中症注意や、帽子もあるとええで。",
-        "冷たい飲み物必須やな。",
-        "日陰探して歩いた方がええで。",
-        "外出は涼しい時間帯がええな。",
-        "エアコン効いたとこで休憩しぃや。",
-        "クールタオル持ってくとええで。",
-        "今日はアイスがうまい日やな。",
-    ]
-    cold_comments = [
-        "だいぶ冷えるで。あったかい格好でな。",
-        "今日は手袋必須やな。",
-        "マフラー忘れたら凍えるで。",
-        "カイロ持ってくとええで。",
-        "外は冷蔵庫みたいやな。",
-        "厚着しとかな後悔するで。",
-        "風邪ひかんようにな。",
-        "暖房の効いたとこで休憩しいや。",
-        "耳あてが恋しい寒さやな。",
-        "寒さに負けんようにしっかり着込むんやで。",
-    ]
-    mild_comments = [
-        "今日はわりと過ごしやすそうや。",
-        "快適な気温やな、外歩くのもええ感じや。",
-        "お出かけ日和やで。",
-        "風が気持ちええ日やな。",
-        "特に対策いらんくらいの天気やで。",
-        "今日はのんびり散歩日和やな。",
-        "空気が心地ええ日や。",
-        "軽装で十分やな。",
-        "気分ええ一日になりそうや。",
-        "こういう日は外で過ごすのが正解やな。",
-    ]
-
-    if thunder:
-        return random.choice(thunder_comments)
-    if max_pop >= 60 or sum_prec >= 1.0:
-        return random.choice(rain_comments)
-    if max_temp >= 30:
-        return random.choice(hot_comments)
-    if max_temp <= 5:
-        return random.choice(cold_comments)
-    return random.choice(mild_comments)
 
 # ---------- Core ----------
 async def get_next_3_hours(session: aiohttp.ClientSession, place_query: str):
@@ -249,11 +333,13 @@ async def get_next_3_hours(session: aiohttp.ClientSession, place_query: str):
     data = await fetch_forecast(session, geo["latitude"], geo["longitude"], geo["timezone"])
     if not data or "hourly" not in data:
         return geo, None, "天気データの取得に失敗したわ。"
+
     times = data["hourly"]["time"]
     temps = data["hourly"]["temperature_2m"]
     pops  = data["hourly"].get("precipitation_probability", [0]*len(times))
     precs = data["hourly"].get("precipitation", [0.0]*len(times))
     codes = data["hourly"].get("weathercode", [0]*len(times))
+    winds = data["hourly"].get("windspeed_10m", [0.0]*len(times))
 
     now = datetime.now(JST)
     rows=[]
@@ -268,7 +354,8 @@ async def get_next_3_hours(session: aiohttp.ClientSession, place_query: str):
                 "temp": float(temps[i]),
                 "pop": int(pops[i]) if i < len(pops) and pops[i] is not None else 0,
                 "precip": float(precs[i]) if i < len(precs) and precs[i] is not None else 0.0,
-                "weathercode": int(codes[i]) if i < len(codes) and codes[i] is not None else 0
+                "weathercode": int(codes[i]) if i < len(codes) and codes[i] is not None else 0,
+                "wind": float(winds[i]) if i < len(winds) and winds[i] is not None else 0.0,
             })
         if len(rows) == 3:
             break
